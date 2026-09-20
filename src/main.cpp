@@ -6,9 +6,14 @@
 #include <ArduinoJson.h>
 #include <RMaker.h>
 #include <WiFiProv.h>
-
+#include "config_fs.h"
+#include "telegram.h"
+#include "devices.h"
 #define PIN_RELE 26
 #define PIN_FAN_CONTROL 25
+
+
+
 char bot_token[100] = "";
 char chat_id[15] = "";
 
@@ -20,7 +25,7 @@ unsigned long lastTimeBotRan;
 unsigned long ultimo_reporte_temp = 0;
 const int boot_button = 0; // Botón físico de BOOT del ESP32
 const int PIN_SENSOR_TEMP = 34; // Pin ADC donde vas a leer el 1N4148 (ejemplo)
- 
+volatile float umbral;
 
 // 1. Creamos un dispositivo dedicado a la configuración para no mezclarlo con tu hardware
 Device config_device("Configuracion");
@@ -30,46 +35,16 @@ Param chat_id_param("Chat ID", "esp.param.string", esp_rmaker_str(""), PROP_FLAG
 
 //Dispositivos estándar RainMaker
 TemperatureSensor sensorTemp("Sensor Temp"); 
+
 Switch actuadorFan("Ventilador");
+Param umbral_temp("Umbral_Temp", "esp.param.Umbral_Temp",value(30.0f), PROP_FLAG_READ | PROP_FLAG_WRITE);
+
 Switch releLuz("Luz");
-Switch motor("Motor Principal");
-Param rpm_act("RPM_ACTUALES","esp,param.rpm_actuales",value(0), PROP_FLAG_READ);
-Param rpm_set("RPM_SETPOINT","esp,param.rpm_setpoint",value(0), PROP_FLAG_READ | PROP_FLAG_WRITE);
+
 
 // Dispositivo Custom (Motor) - Le mezclamos control y lectura
 
 
-// --- MANEJO DE ARCHIVOS (LittleFS) ---
-void saveConfigFile() {
-  JsonDocument json;
-  json["bot_token"] = bot_token;
-  json["chat_id"] = chat_id;
-  
-  File configFile = LittleFS.open("/config.json", "w");
-  if (configFile) {
-    serializeJson(json, configFile);
-    configFile.close();
-    Serial.println("✅ Archivo guardado correctamente en LittleFS!");
-  }
-  else{
-    Serial.println("❌ ERROR FATAL: No se pudo crear config.json");
-    return;
-  }
-}
-
-void loadConfigFile() {
-  if (LittleFS.exists("/config.json")) {
-    File configFile = LittleFS.open("/config.json", "r");
-    if (configFile) {
-      JsonDocument json;
-      DeserializationError error = deserializeJson(json, configFile);
-      if (!error) {
-        strcpy(bot_token, json["bot_token"]);
-        strcpy(chat_id, json["chat_id"]);
-      }
-    }
-  }
-}
 
 void sysProvEvent(arduino_event_t *sys_event) {
   switch (sys_event->event_id) {
@@ -80,90 +55,87 @@ void sysProvEvent(arduino_event_t *sys_event) {
   }
 }
 
-// --------- LÓGICA DE TELEGRAM -----------
-void handleNewMessages(int numNewMessages) {
-  for (int i = 0; i < numNewMessages; i++) {
-    String text = bot->messages[i].text;
-    String id = String(bot->messages[i].chat_id);
-    
-    if (id != chat_id){
-      continue; // Ignora mensajes de gente que no seas vos
-    }
-    
-    // Acá podés agregar comandos como "/estado", "/temp", "/motor"
-    if (text == "/start") {
-      String welcome = "Bot de Comunicaciones:\n/estado - Ver estado del sistema\n/reset_wifi (Cuidado)";
-      bot->sendMessage(id, welcome, "");
-    }
-    
-    if (text == "/estado") {
-      // Ejemplo a futuro: leer variables del motor y temperatura y mandarlas
-      bot->sendMessage(id, "El sistema está funcionando. (Acá irán los datos del motor/temp)", "");
-    }
-  }
-}
 
-// --------- CALLBACK DE RAINMAKER -----------
 void write_callback(Device *device, Param *param, const param_val_t val, void *priv_data, write_ctx_t *ctx) {
   const char *device_name = device->getDeviceName();
   const char *param_name = param->getParamName();
-  Serial.printf(">>> Callback disparado! Dispositivo: '%s' | Param: '%s'\n", device_name, param_name);
-  // A. BLOQUE DE CONFIGURACIÓN (No tocar)
-  if (strcmp(device_name, "Configuracion") == 0) { 
-    
-    if (strcmp(param_name, "Bot Token") == 0) {
-      memset(bot_token, 0, sizeof(bot_token));
-      strncpy(bot_token, val.val.s, sizeof(bot_token) - 1);
-      param->updateAndReport(val);
-      saveConfigFile();
-      
-      if (bot != nullptr) {
-        delete bot;
-        bot = nullptr;
-      }
-      bot = new UniversalTelegramBot(bot_token, client);
-      Serial.println("Bot token guardado y bot recreado.");
-    }
-    
-    else if (strcmp(param_name, "Chat ID") == 0) {
-      memset(chat_id, 0, sizeof(chat_id));
-      strncpy(chat_id, val.val.s, sizeof(chat_id) - 1);
-      param->updateAndReport(val);
-      saveConfigFile();
-      Serial.println("Chat ID guardado.");
-    }
-  }
-    // Ejemplos vacíos para los actuadores:
-    else if (strcmp(device_name, "Ventilador") == 0) {
-      if (strcmp(param_name, "Power") == 0) {
-        bool estado = val.val.b;
-        Serial.printf("RainMaker envió el estado: %d\n", estado);
-        digitalWrite(PIN_FAN_CONTROL, estado);
-        param->updateAndReport(val); 
-      }
-    }
-    else if (strcmp(device_name, "Luz") == 0) {
-      if (strcmp(param_name, "Power") == 0) {
-        bool estado_luz = val.val.b;
-        Serial.printf("RainMaker envió el estado: %d\n", estado_luz);
-        digitalWrite(PIN_RELE,!estado_luz);
-        param->updateAndReport(val);
+  
+  DeviceType current_device = getDeviceType(device_name);
+  ParamType current_param = getParamType(param_name);
 
+  switch (current_device) {
+    
+    case DEVICE_CONFIG:
+      
+      switch (current_param) {
+        
+        case PARAM_BOT_TOKEN:
+          memset(bot_token, 0, sizeof(bot_token));
+          strncpy(bot_token, val.val.s, sizeof(bot_token) - 1);
+          param->updateAndReport(val);
+          saveConfigFile();
+          
+          if (bot != nullptr) {
+            delete bot;
+            bot = nullptr;
+            }
+          bot = new UniversalTelegramBot(bot_token, client);
+          Serial.println("Bot token guardado y bot recreado.");
+          break;
+
+        case PARAM_CHAT_ID:
+          memset(chat_id, 0, sizeof(chat_id));
+          strncpy(chat_id, val.val.s, sizeof(chat_id) - 1);
+          param->updateAndReport(val);
+          saveConfigFile();
+          Serial.println("Chat ID guardado.");
+          break;
+        default: break;
       }
-    }
-    else if (strcmp(device_name, "Motor Principal") == 0) {
-      if (strcmp(param_name, "Power") == 0) {
-        // bool estado = val.val.b;
-        // digitalWrite(PIN_MOTOR, estado);
-        param->updateAndReport(val); 
+      break;
+
+    case DEVICE_FAN:
+      
+      if (current_param == PARAM_POWER) {
+        bool estado = val.val.b;
+        digitalWrite(PIN_FAN_CONTROL, estado);
+        param->updateAndReport(val);
       }
-    }
+      else if (current_param == PARAM_UMBRAL_TEMP){
+        umbral = val.val.b;
+        Serial.printf("El umbral de temperatura fue seteado a %.2f°C\n");
+        param->updateAndReport(val);
+      }
+      break;
+
+    case DEVICE_LIGHT:
+      
+      if(current_param == PARAM_POWER){
+        bool estado_luz = val.val.b;
+        digitalWrite(PIN_RELE, !estado_luz);
+        param->updateAndReport(val);
+      }
+      break;
+
+    case DEVICE_TEMP:
+      
+      if (current_param == PARAM_UMBRAL_TEMP) {
+        // float umbral = val.val.f;
+        // param->updateAndReport(val);
+      }
+      break;
+
+    case DEVICE_UNKNOWN:
+    default:
+      break;
+  }
 }
 
 
-
 void setup() {
+ 
   Serial.begin(115200);
+  
   pinMode(boot_button, INPUT_PULLUP); // Botón físico de reset
   pinMode(PIN_RELE, OUTPUT);
   pinMode(PIN_FAN_CONTROL, OUTPUT);
@@ -189,13 +161,13 @@ void setup() {
   config_device.addParam(chat_id_param);
   
   // B. Configurar Dispositivo Motor
-  motor.addCb(write_callback);
-  motor.addParam(rpm_act);
-  motor.addParam(rpm_set);
 
+
+  
 
   // C. Enganchar los callbacks de los switches estándar
   actuadorFan.addCb(write_callback);
+  actuadorFan.addParam(umbral_temp);
   releLuz.addCb(write_callback);
 
   // D. Colgar todos los Dispositivos al Nodo Principal
@@ -203,7 +175,7 @@ void setup() {
   my_node.addDevice(sensorTemp);
   my_node.addDevice(actuadorFan);
   my_node.addDevice(releLuz);
-  my_node.addDevice(motor);
+
 
   // --- INICIO DE SERVICIOS ---
   RMaker.start(); // Prepara RainMaker
