@@ -10,6 +10,7 @@ void saveConfigFile() {
   JsonDocument json;
   json["bot_token"] = bot_token;
   json["chat_id"] = chat_id;
+  json["umbral"] = umbral;
   
   File configFile = LittleFS.open("/config.json", "w");
   if (configFile) {
@@ -30,6 +31,7 @@ void loadConfigFile() {
       if (!error) {
         strcpy(bot_token, json["bot_token"]);
         strcpy(chat_id, json["chat_id"]);
+        umbral = json["umbral"] | 50.0f; //inicializa el umbral en 50°C si no hay datos por defecto
       }
       configFile.close();
     }

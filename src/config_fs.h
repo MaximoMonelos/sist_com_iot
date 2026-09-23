@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 
+extern volatile float umbral;
 // Declaramos que estas funciones existen y se pueden usar desde cualquier lado
 void saveConfigFile();
 void loadConfigFile();

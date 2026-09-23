@@ -9,9 +9,10 @@
 #include "config_fs.h"
 #include "telegram.h"
 #include "devices.h"
+
 #define PIN_RELE 26
 #define PIN_FAN_CONTROL 25
-
+#define PIN_SENSOR_TEMP 34
 
 
 char bot_token[100] = "";
@@ -24,11 +25,15 @@ UniversalTelegramBot *bot;
 unsigned long lastTimeBotRan;
 unsigned long ultimo_reporte_temp = 0;
 const int boot_button = 0; // Botón físico de BOOT del ESP32
-const int PIN_SENSOR_TEMP = 34; // Pin ADC donde vas a leer el 1N4148 (ejemplo)
-volatile float umbral;
+volatile float umbral = 50; // SE PRENDE A LOS 50°C POR DEFAULT, SE PUEDE CAMBIAR EL LA APP
+bool FAN = false;
 
-// 1. Creamos un dispositivo dedicado a la configuración para no mezclarlo con tu hardware
-Device config_device("Configuracion");
+unsigned long ultimo_muestreo_temp = 0;
+uint32_t acumulador_adc = 0; 
+int contador_muestras = 0;
+
+
+Device config_device("Configuracion"); //dispositivo para los parámetros de configuración del bot
 
 Param token_param("Bot Token", "esp.param.string", esp_rmaker_str(""), PROP_FLAG_READ | PROP_FLAG_WRITE);
 Param chat_id_param("Chat ID", "esp.param.string", esp_rmaker_str(""), PROP_FLAG_READ | PROP_FLAG_WRITE);
@@ -37,13 +42,9 @@ Param chat_id_param("Chat ID", "esp.param.string", esp_rmaker_str(""), PROP_FLAG
 TemperatureSensor sensorTemp("Sensor Temp"); 
 
 Switch actuadorFan("Ventilador");
-Param umbral_temp("Umbral_Temp", "esp.param.Umbral_Temp",value(30.0f), PROP_FLAG_READ | PROP_FLAG_WRITE);
+Param umbral_temp("Umbral_Temp", "esp.param.Umbral_Temp",value(50.0f), PROP_FLAG_READ | PROP_FLAG_WRITE);
 
 Switch releLuz("Luz");
-
-
-// Dispositivo Custom (Motor) - Le mezclamos control y lectura
-
 
 
 void sysProvEvent(arduino_event_t *sys_event) {
@@ -102,9 +103,10 @@ void write_callback(Device *device, Param *param, const param_val_t val, void *p
         param->updateAndReport(val);
       }
       else if (current_param == PARAM_UMBRAL_TEMP){
-        umbral = val.val.b;
-        Serial.printf("El umbral de temperatura fue seteado a %.2f°C\n");
+        umbral = val.val.f;
+        Serial.printf("El umbral de temperatura fue seteado a %.2f°C\n", umbral);
         param->updateAndReport(val);
+        saveConfigFile();
       }
       break;
 
@@ -142,9 +144,13 @@ void setup() {
   digitalWrite(PIN_RELE, HIGH);  //Luz Apagada por default
   digitalWrite(PIN_FAN_CONTROL, LOW); //Fan Apagado por default
 
+  analogReadResolution(12);
+  
+
 
   if (!LittleFS.begin(true)) { Serial.println("Error LittleFS"); return; }
   loadConfigFile(); 
+  
 
   // --- CONFIGURACIÓN DEL NODO RAINMAKER ---
   Node my_node = RMaker.initNode("ESP32-Comunicaciones"); // Nombre de tu placa
@@ -160,15 +166,13 @@ void setup() {
   config_device.addParam(token_param);
   config_device.addParam(chat_id_param);
   
-  // B. Configurar Dispositivo Motor
-
-
   
 
   // C. Enganchar los callbacks de los switches estándar
   actuadorFan.addCb(write_callback);
   actuadorFan.addParam(umbral_temp);
   releLuz.addCb(write_callback);
+  umbral_temp.updateAndReport(esp_rmaker_float(umbral));
 
   // D. Colgar todos los Dispositivos al Nodo Principal
   my_node.addDevice(config_device);
@@ -222,20 +226,70 @@ void loop() {
     handleNewMessages(numNewMessages);
     lastTimeBotRan = millis();
   }
-  if (millis() - ultimo_reporte_temp > 5000) {
-    ultimo_reporte_temp = millis();
+  // Entra acá cada 100 ms
+  if (millis() - ultimo_muestreo_temp >= 50) {
+    ultimo_muestreo_temp = millis();
 
-    // 1. Acá harías tu analogRead(PIN_SENSOR_TEMP)
-    // 2. Aplicás la matemática de la recta para sacar la temperatura a partir de los mV
+    // 1. Tomamos la muestra y la sumamos al pozo
+    acumulador_adc += analogRead(PIN_SENSOR_TEMP);
+    contador_muestras++;
+
+    // 2. Si ya juntamos 100 muestras (100 * 50ms = 5000ms = 5 segundos)
+    if (contador_muestras >= 100) {
+      
+      
+      float adc_promedio = (float)acumulador_adc / 50.0;
+
+      
+      float voltaje_mv = (adc_promedio / 4095.0) * 3300.0;
+
+      
+      float ganancia_av = 22.0;
+      float temperatura_calculada = ((voltaje_mv / ganancia_av) + 50.0) / 2.0;
+
+      Serial.printf("ADC Promedio: %.1f | Temp: %.2f °C\n", adc_promedio, temperatura_calculada);
+
+      
+      sensorTemp.updateAndReportParam(ESP_RMAKER_DEF_TEMPERATURE_NAME, temperatura_calculada);
+
     
-    // Dato inventado para testear:
-    float temperatura_calculada = 24.5; 
+      acumulador_adc = 0;
+      contador_muestras = 0;
+     
+      if (temperatura_calculada >= umbral && !FAN) {
+          
+          FAN = true; 
+          
+          digitalWrite(PIN_FAN_CONTROL, FAN);
+          actuadorFan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, FAN);
+          
+          String mensaje_alerta = "⚠️ Alerta térmica! Se encendió automáticamente el ventilador, Temperatura: " + String(temperatura_calculada, 1) + " °C";
+          esp_rmaker_raise_alert(mensaje_alerta.c_str());
 
-    // 3. Reportar a RainMaker:
-    // Al ser un dispositivo estándar TemperatureSensor, su parámetro interno se llama ESP_RMAKER_DEF_TEMPERATURE_NAME
-    sensorTemp.updateAndReportParam(ESP_RMAKER_DEF_TEMPERATURE_NAME, temperatura_calculada);
-    
-    Serial.printf("Temperatura reportada a la nube: %.2f °C\n", temperatura_calculada);
-  }
+          if (strlen(chat_id) > 0) {
+          
+            bot->sendMessage(chat_id, mensaje_alerta, "");
+        
+          } 
+                    
+      } 
+      // Si bajó la temperatura Y el ventilador sigue prendido
+      else if (temperatura_calculada < umbral && FAN) {
+          
+          FAN = false; 
+          
+          digitalWrite(PIN_FAN_CONTROL, FAN);
+          actuadorFan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, FAN);
+          
+          String mensaje_ok = "✅ Temperatura estabilizada (" + String(temperatura_calculada, 1) + " °C). Ventilador apagado.";
+          esp_rmaker_raise_alert(mensaje_ok.c_str());
 
+          if (strlen(chat_id) > 0) {
+          
+            bot->sendMessage(chat_id, mensaje_ok, "");
+        
+          } 
+        }
+      } 
+    } 
 }
