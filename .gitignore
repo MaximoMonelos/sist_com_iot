@@ -3,3 +3,12 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+# Entorno virtual de Python
+venv/
+
+# Resultados del ensayo (para no pisar datos ni subir archivos pesados)
+*.csv
+*.png
+
+# Caché de Python (buena práctica general)
+__pycache__/

@@ -15,6 +15,9 @@
 #define PIN_SENSOR_TEMP 34
 
 
+
+system_state_t state = {25, umbral, 0, 0};
+
 char bot_token[100] = "";
 char chat_id[15] = "";
 
@@ -25,7 +28,7 @@ UniversalTelegramBot *bot;
 unsigned long lastTimeBotRan;
 unsigned long ultimo_reporte_temp = 0;
 const int boot_button = 0; // Botón físico de BOOT del ESP32
-volatile float umbral = 50; // SE PRENDE A LOS 50°C POR DEFAULT, SE PUEDE CAMBIAR EL LA APP
+volatile float umbral = 50; // SE PRENDE A LOS 50°C POR DEFAULT, SE PUEDE CAMBIAR EN LA APP
 bool FAN = false;
 
 unsigned long ultimo_muestreo_temp = 0;
@@ -43,7 +46,7 @@ TemperatureSensor sensorTemp("Sensor Temp");
 
 Switch actuadorFan("Ventilador");
 Param umbral_temp("Umbral_Temp", "esp.param.Umbral_Temp",value(50.0f), PROP_FLAG_READ | PROP_FLAG_WRITE);
-
+Param cmd_id("cmd_id", "esp.param.cmd_id",value(123), PROP_FLAG_READ | PROP_FLAG_WRITE);
 Switch releLuz("Luz");
 
 
@@ -100,13 +103,23 @@ void write_callback(Device *device, Param *param, const param_val_t val, void *p
       if (current_param == PARAM_POWER) {
         bool estado = val.val.b;
         digitalWrite(PIN_FAN_CONTROL, estado);
-        param->updateAndReport(val);
+        bool estado_real = digitalRead(PIN_FAN_CONTROL); 
+        state.estado_ventilador = estado_real;
+        //state.estado_ventilador = estado;
+        //param->updateAndReport(val);
+        param->updateAndReport(esp_rmaker_bool(estado_real)); 
+        //Matar esto y dejar lo que estaba antes después de las pruebas.
       }
       else if (current_param == PARAM_UMBRAL_TEMP){
         umbral = val.val.f;
         Serial.printf("El umbral de temperatura fue seteado a %.2f°C\n", umbral);
         param->updateAndReport(val);
         saveConfigFile();
+        state.umbral = umbral;
+      }
+      else if (current_param == PARAM_CMD_ID) { 
+        // Solo lo reportamos de vuelta para darle el "Acuse de recibo" a Python
+        param->updateAndReport(val);
       }
       break;
 
@@ -116,6 +129,7 @@ void write_callback(Device *device, Param *param, const param_val_t val, void *p
         bool estado_luz = val.val.b;
         digitalWrite(PIN_RELE, !estado_luz);
         param->updateAndReport(val);
+        state.estado_luz = estado_luz;
       }
       break;
 
@@ -147,7 +161,6 @@ void setup() {
   analogReadResolution(12);
   
 
-
   if (!LittleFS.begin(true)) { Serial.println("Error LittleFS"); return; }
   loadConfigFile(); 
   
@@ -171,6 +184,7 @@ void setup() {
   // C. Enganchar los callbacks de los switches estándar
   actuadorFan.addCb(write_callback);
   actuadorFan.addParam(umbral_temp);
+  actuadorFan.addParam(cmd_id);
   releLuz.addCb(write_callback);
   umbral_temp.updateAndReport(esp_rmaker_float(umbral));
 
@@ -203,7 +217,12 @@ void setup() {
   // Preparamos Telegram
   client.setInsecure();
   bot = new UniversalTelegramBot(bot_token, client);
+  if (strlen(chat_id) > 0 && strlen(bot_token) > 0) {
+      String msj_inicio = "🤖 Nodo ESP32 iniciado correctamente.\n\nEscribí /help para ver los comandos disponibles.";
+      bot->sendMessage(chat_id, msj_inicio, "");
+  }
 }
+
 
 void loop() {
   // Lógica de reseteo físico (mantener pulsado botón BOOT por ~3 segundos)
@@ -223,7 +242,7 @@ void loop() {
   // Lógica de Telegram
   if (millis() > lastTimeBotRan + 1000) {
     int numNewMessages = bot->getUpdates(bot->last_message_received + 1);
-    handleNewMessages(numNewMessages);
+    handleNewMessages(numNewMessages, &state);
     lastTimeBotRan = millis();
   }
   // Entra acá cada 100 ms
@@ -238,32 +257,34 @@ void loop() {
     if (contador_muestras >= 100) {
       
       
-      float adc_promedio = (float)acumulador_adc / 50.0;
+      float adc_promedio = (float)acumulador_adc / 100.0;
 
       
       float voltaje_mv = (adc_promedio / 4095.0) * 3300.0;
 
       
       float ganancia_av = 22.0;
-      float temperatura_calculada = ((voltaje_mv / ganancia_av) + 50.0) / 2.0;
-
-      Serial.printf("ADC Promedio: %.1f | Temp: %.2f °C\n", adc_promedio, temperatura_calculada);
+      
+      state.temperatura = ((voltaje_mv / ganancia_av) + 50.0) / 2.0;
+      
+      Serial.printf("ADC Promedio: %.1f | Temp: %.2f °C\n", adc_promedio, state.temperatura);
 
       
-      sensorTemp.updateAndReportParam(ESP_RMAKER_DEF_TEMPERATURE_NAME, temperatura_calculada);
+      sensorTemp.updateAndReportParam(ESP_RMAKER_DEF_TEMPERATURE_NAME, state.temperatura);
 
     
       acumulador_adc = 0;
       contador_muestras = 0;
      
-      if (temperatura_calculada >= umbral && !FAN) {
+      if (state.temperatura >= umbral && !FAN) {
           
           FAN = true; 
+          state.estado_ventilador = FAN;
           
           digitalWrite(PIN_FAN_CONTROL, FAN);
           actuadorFan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, FAN);
           
-          String mensaje_alerta = "⚠️ Alerta térmica! Se encendió automáticamente el ventilador, Temperatura: " + String(temperatura_calculada, 1) + " °C";
+          String mensaje_alerta = "⚠️ Alerta térmica! Se encendió automáticamente el ventilador, Temperatura: " + String(state.temperatura, 1) + " °C";
           esp_rmaker_raise_alert(mensaje_alerta.c_str());
 
           if (strlen(chat_id) > 0) {
@@ -274,14 +295,14 @@ void loop() {
                     
       } 
       // Si bajó la temperatura Y el ventilador sigue prendido
-      else if (temperatura_calculada < umbral && FAN) {
+      else if (state.temperatura < umbral && FAN) {
           
           FAN = false; 
-          
+          state.estado_ventilador = FAN;
           digitalWrite(PIN_FAN_CONTROL, FAN);
           actuadorFan.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, FAN);
           
-          String mensaje_ok = "✅ Temperatura estabilizada (" + String(temperatura_calculada, 1) + " °C). Ventilador apagado.";
+          String mensaje_ok = "✅ Temperatura estabilizada (" + String(state.temperatura, 1) + " °C). Ventilador apagado.";
           esp_rmaker_raise_alert(mensaje_ok.c_str());
 
           if (strlen(chat_id) > 0) {
